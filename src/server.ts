@@ -1,4 +1,5 @@
 import { createWorkersAI } from "workers-ai-provider";
+import { createBarewireFetch } from "@barewire/sdk";
 import { callable, routeAgentRequest, type Schedule } from "agents";
 import { getSchedulePrompt, scheduleSchema } from "agents/schedule";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
@@ -15,7 +16,7 @@ export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
   chatRecovery = true;
 
-  onStart() {
+  async onStart() {
     // Configure OAuth popup behavior for MCP servers that require authentication
     this.mcp.configureOAuthCallback({
       customHandler: (result) => {
@@ -32,9 +33,10 @@ export class ChatAgent extends AIChatAgent<Env> {
       }
     });
 
-    // Add GlobalCheck as an MCP server if its URL is provided in the environment
-    if (this.env.GLOBALCHECK_URL) {
-      this.addMcpServer("GlobalCheck", this.env.GLOBALCHECK_URL);
+    // Add GlobalCheck MCP if URL is provided in environment variables
+    if (this.env.GLOBALCHECK_MCP_URL) {
+      console.log('Adding GlobalCheck MCP server...');
+      await this.addMcpServer('GlobalCheck', this.env.GLOBALCHECK_MCP_URL);
     }
   }
 
@@ -50,11 +52,11 @@ export class ChatAgent extends AIChatAgent<Env> {
 
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
-    const workersai = createWorkersAI({
-      binding: this.env.AI,
-      // Route all LLM requests through Barewire if BAREWIRE_URL is provided in the environment
-      ...(this.env.BAREWIRE_URL && { gatewayUrl: this.env.BAREWIRE_URL })
+    const barewireFetch = createBarewireFetch({
+      proxyUrl: this.env.BAREWIRE_PROXY_URL || 'https://proxy.barewire.com/v1',
+      apiKey: this.env.BAREWIRE_API_KEY,
     });
+    const workersai = createWorkersAI({ binding: this.env.AI, fetch: barewireFetch });
 
     const result = streamText({
       model: workersai("@cf/moonshotai/kimi-k2.6", {
