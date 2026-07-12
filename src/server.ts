@@ -1,5 +1,5 @@
 import { createWorkersAI } from "workers-ai-provider";
-import { createBarewireFetch } from "@barewire/sdk";
+import OpenAI from "openai";
 import { callable, routeAgentRequest, type Schedule } from "agents";
 import { getSchedulePrompt, scheduleSchema } from "agents/schedule";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
@@ -16,7 +16,7 @@ export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
   chatRecovery = true;
 
-  async onStart() {
+  onStart() {
     // Configure OAuth popup behavior for MCP servers that require authentication
     this.mcp.configureOAuthCallback({
       customHandler: (result) => {
@@ -32,12 +32,6 @@ export class ChatAgent extends AIChatAgent<Env> {
         );
       }
     });
-
-    // Add GlobalCheck MCP if URL is provided in environment variables
-    if (this.env.GLOBALCHECK_MCP_URL) {
-      console.log('Adding GlobalCheck MCP server...');
-      await this.addMcpServer('GlobalCheck', this.env.GLOBALCHECK_MCP_URL);
-    }
   }
 
   @callable()
@@ -52,16 +46,17 @@ export class ChatAgent extends AIChatAgent<Env> {
 
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
-    const barewireFetch = createBarewireFetch({
-      proxyUrl: this.env.BAREWIRE_PROXY_URL || 'https://proxy.barewire.com/v1',
-      apiKey: this.env.BAREWIRE_API_KEY,
-    });
-    const workersai = createWorkersAI({ binding: this.env.AI, fetch: barewireFetch });
+    const workersai = createWorkersAI({ binding: this.env.AI });
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.6", {
-        sessionAffinity: this.sessionAffinity
-      }),
+      model: this.env.BAREWIRE_URL
+        ? new OpenAI({
+            baseURL: this.env.BAREWIRE_URL,
+            apiKey: this.env.BAREWIRE_API_KEY || "sk-barewire", // Barewire often manages authentication itself, but the OpenAI client requires this argument.
+          }).chat.completions
+        : workersai("@cf/moonshotai/kimi-k2.6", {
+            sessionAffinity: this.sessionAffinity
+          }),
       system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
 
 ${getSchedulePrompt({ date: new Date() })}
