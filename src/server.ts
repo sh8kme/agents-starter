@@ -1,5 +1,4 @@
 import { createWorkersAI } from "workers-ai-provider";
-import OpenAI from "openai";
 import { callable, routeAgentRequest, type Schedule } from "agents";
 import { getSchedulePrompt, scheduleSchema } from "agents/schedule";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
@@ -16,7 +15,7 @@ export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
   chatRecovery = true;
 
-  onStart() {
+  async onStart() {
     // Configure OAuth popup behavior for MCP servers that require authentication
     this.mcp.configureOAuthCallback({
       customHandler: (result) => {
@@ -32,6 +31,22 @@ export class ChatAgent extends AIChatAgent<Env> {
         );
       }
     });
+
+    // Automatically add GlobalCheck MCP if GLOBALCHECK_URL is provided and not already configured
+    if (this.env.GLOBALCHECK_URL) {
+      try {
+        const servers = await this.mcp.listServers();
+        const globalCheckExists = servers.some(
+          (server) => server.url === this.env.GLOBALCHECK_URL
+        );
+        if (!globalCheckExists) {
+          await this.addMcpServer("GlobalCheck", this.env.GLOBALCHECK_URL);
+          console.log("GlobalCheck MCP server added successfully.");
+        }
+      } catch (error) {
+        console.error("Failed to add GlobalCheck MCP server:", error);
+      }
+    }
   }
 
   @callable()
@@ -46,17 +61,15 @@ export class ChatAgent extends AIChatAgent<Env> {
 
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
-    const workersai = createWorkersAI({ binding: this.env.AI });
+    const workersai = createWorkersAI({
+      binding: this.env.AI,
+      ...(this.env.BAREWIRE_GATEWAY_URL && { gateway: this.env.BAREWIRE_GATEWAY_URL })
+    });
 
     const result = streamText({
-      model: this.env.BAREWIRE_URL
-        ? new OpenAI({
-            baseURL: this.env.BAREWIRE_URL,
-            apiKey: this.env.BAREWIRE_API_KEY || "sk-barewire", // Barewire often manages authentication itself, but the OpenAI client requires this argument.
-          }).chat.completions
-        : workersai("@cf/moonshotai/kimi-k2.6", {
-            sessionAffinity: this.sessionAffinity
-          }),
+      model: workersai("@cf/moonshotai/kimi-k2.6", {
+        sessionAffinity: this.sessionAffinity
+      }),
       system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
 
 ${getSchedulePrompt({ date: new Date() })}
