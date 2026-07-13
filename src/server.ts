@@ -10,6 +10,15 @@ import {
   tool
 } from "ai";
 import { z } from "zod";
+import { OpenAI } from "ai/openai"; // For Barewire integration
+
+// Define the environment variables for your Worker
+interface Env {
+  AI: Ai; // Workers AI binding
+  BAREWIRE_BASE_URL?: string; // Optional Barewire proxy URL
+  BAREWIRE_API_KEY?: string; // Optional Barewire API key
+  GLOBALCHECK_URL?: string; // Optional GlobalCheck MCP URL
+}
 
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
@@ -32,19 +41,24 @@ export class ChatAgent extends AIChatAgent<Env> {
       }
     });
 
-    // Automatically add GlobalCheck MCP if GLOBALCHECK_URL is provided and not already configured
+    // GlobalCheck Integration: Add GlobalCheck as an MCP server if configured
     if (this.env.GLOBALCHECK_URL) {
-      try {
-        const servers = await this.mcp.listServers();
-        const globalCheckExists = servers.some(
-          (server) => server.url === this.env.GLOBALCHECK_URL
-        );
-        if (!globalCheckExists) {
-          await this.addMcpServer("GlobalCheck", this.env.GLOBALCHECK_URL);
-          console.log("GlobalCheck MCP server added successfully.");
+      const globalCheckServerName = "GlobalCheck";
+      const existingServers = await this.mcp.listMcpServers();
+      const globalCheckExists = existingServers.some(
+        (s) => s.name === globalCheckServerName && s.url === this.env.GLOBALCHECK_URL
+      );
+
+      if (!globalCheckExists) {
+        console.log(`[GlobalCheck] Adding MCP server: ${this.env.GLOBALCHECK_URL}`);
+        try {
+          await this.addMcpServer(globalCheckServerName, this.env.GLOBALCHECK_URL);
+          console.log("[GlobalCheck] MCP server added successfully.");
+        } catch (error) {
+          console.error("[GlobalCheck] Failed to add MCP server:", error);
         }
-      } catch (error) {
-        console.error("Failed to add GlobalCheck MCP server:", error);
+      } else {
+        console.log("[GlobalCheck] MCP server already configured.");
       }
     }
   }
@@ -61,20 +75,37 @@ export class ChatAgent extends AIChatAgent<Env> {
 
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
-    const workersai = createWorkersAI({
-      binding: this.env.AI,
-      ...(this.env.BAREWIRE_GATEWAY_URL && { gateway: this.env.BAREWIRE_GATEWAY_URL })
-    });
+    const workersai = createWorkersAI({ binding: this.env.AI });
+
+    // Barewire Integration: Use Barewire as an agentic proxy if configured, otherwise Workers AI
+    let model;
+    if (this.env.BAREWIRE_BASE_URL && this.env.BAREWIRE_API_KEY) {
+      console.log(`[Barewire] Using agentic proxy at: ${this.env.BAREWIRE_BASE_URL}`);
+      const barewire = new OpenAI({
+        baseURL: this.env.BAREWIRE_BASE_URL,
+        apiKey: this.env.BAREWIRE_API_KEY,
+        defaultHeaders: { // Use defaultHeaders for custom headers
+          'X-Barewire-Agent-ID': 'cloudflare-agents-starter'
+        }
+      });
+      // The model name 'gpt-4o' is used here as a common OpenAI-compatible model.
+      // Barewire will route this request according to its own configuration,
+      // potentially to Workers AI, or another provider.
+      model = barewire.chat('gpt-4o');
+    } else {
+      console.log("[Barewire] Using Workers AI directly.");
+      model = workersai("@cf/moonshotai/kimi-k2.6", {
+        sessionAffinity: this.sessionAffinity
+      });
+    }
 
     const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.6", {
-        sessionAffinity: this.sessionAffinity
-      }),
+      model: model, // Use the selected model
       system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
 
 ${getSchedulePrompt({ date: new Date() })}
 
-If the user asks to schedule a task, use the schedule tool to schedule the task.`,
+If the user asks to schedule a task, use the schedule tool to schedule the task.`, 
       // Prune old tool calls to save tokens on long conversations
       messages: pruneMessages({
         messages: await convertToModelMessages(this.messages),
