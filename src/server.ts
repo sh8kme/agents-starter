@@ -10,7 +10,8 @@ import {
   tool
 } from "ai";
 import { z } from "zod";
-import { OpenAI } from "openai";
+// Barewire SDK for agentic proxying and observability
+import { createBarewire } from "@barewire/sdk";
 
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
@@ -32,22 +33,6 @@ export class ChatAgent extends AIChatAgent<Env> {
         );
       }
     });
-
-    // GlobalCheck Integration: Optionally connect to a GlobalCheck MCP server
-    // Set GLOBALCHECK_MCP_URL in your environment (e.g., wrangler.toml or .dev.vars)
-    // to enable compliance features.
-    if (this.env.GLOBALCHECK_MCP_URL) {
-      try {
-        await this.addMcpServer("globalcheck", this.env.GLOBALCHECK_MCP_URL, {
-          isComplianceMcp: true, // Mark this as a compliance MCP
-          // Add any required auth headers or API keys here if GlobalCheck requires them
-          // headers: { "Authorization": `Bearer ${this.env.GLOBALCHECK_API_KEY}` }
-        });
-        console.log("Connected to GlobalCheck MCP successfully.");
-      } catch (error) {
-        console.error("Failed to connect to GlobalCheck MCP:", error);
-      }
-    }
   }
 
   @callable()
@@ -62,26 +47,27 @@ export class ChatAgent extends AIChatAgent<Env> {
 
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
+    // Original Workers AI client for direct access if Barewire is not used for a specific call
+    const workersaiClient = createWorkersAI({ binding: this.env.AI });
 
-    let modelProvider;
-    // Barewire Integration: Optionally route LLM calls through Barewire's agentic proxy
-    // Set BAREWIRE_BASE_URL and OPENAI_API_KEY (if needed by Barewire for upstream) 
-    // in your environment (e.g., wrangler.toml or .dev.vars) to enable agentic features.
-    if (this.env.BAREWIRE_BASE_URL) {
-      const barewireClient = new OpenAI({
-        apiKey: this.env.OPENAI_API_KEY || "sk-", // Barewire might require an API key for upstream, or a dummy one if it proxies Workers AI
-        baseURL: this.env.BAREWIRE_BASE_URL,
-      });
-      modelProvider = barewireClient.chat.completions;
-    } else {
-      const workersai = createWorkersAI({ binding: this.env.AI });
-      modelProvider = workersai("@cf/moonshotai/kimi-k2.6", {
-        sessionAffinity: this.sessionAffinity
-      });
-    }
+    // Initialize Barewire client for agentic proxying and observability.
+    // Ensure BAREWIRE_API_KEY and BAREWIRE_URL are configured in your environment (e.g., wrangler.toml).
+    const barewire = createBarewire({
+      apiKey: this.env.BAREWIRE_API_KEY,
+      baseURL: this.env.BAREWIRE_URL || "https://api.barewire.com/v1", // Default Barewire Edge Proxy URL
+    });
+
+    // Create the original Workers AI model instance
+    const actualWorkersAIModel = workersaiClient("@cf/moonshotai/kimi-k2.6", {
+      sessionAffinity: this.sessionAffinity
+    });
+
+    // Wrap the actual Workers AI model with Barewire for agentic capabilities, 
+    // enabling features like guardrails, observability, and compliance checks.
+    const proxiedModel = barewire.wrapModel(actualWorkersAIModel);
 
     const result = streamText({
-      model: modelProvider,
+      model: proxiedModel,
       system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
 
 ${getSchedulePrompt({ date: new Date() })}
