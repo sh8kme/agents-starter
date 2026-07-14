@@ -10,8 +10,31 @@ import {
   tool
 } from "ai";
 import { z } from "zod";
-// Barewire SDK for agentic proxying and observability
-import { createBarewire } from "@barewire/sdk";
+
+// Helper function to proxy requests through Barewire, routing all traffic for observability and control.
+// Barewire typically expects the original request details to be forwarded, with a special header
+// indicating the original target URL.
+const createBarewireProxyFetch = (barewireProxyUrl?: string) => {
+  if (!barewireProxyUrl) {
+    console.warn("BAREWIRE_PROXY_URL is not set. Barewire proxying will be skipped for tool calls.");
+    return globalThis.fetch; // Use native fetch if URL not provided
+  }
+  return async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const targetUrl = request.url;
+
+    const proxyRequest = new Request(barewireProxyUrl, {
+      method: request.method,
+      headers: {
+        ...Object.fromEntries(request.headers.entries()),
+        "X-Barewire-Target-URL": targetUrl, // Barewire-specific header
+      },
+      body: request.body,
+      duplex: request.body ? 'half' : undefined, // Required for streaming if body is a ReadableStream
+    });
+    return globalThis.fetch(proxyRequest);
+  };
+};
 
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
@@ -33,6 +56,16 @@ export class ChatAgent extends AIChatAgent<Env> {
         );
       }
     });
+
+    // Integrate GlobalCheck as a compliance Multi-Compliance Point (MCP) server.
+    // This enables centralized policy enforcement, audit trails, and security for agent operations.
+    if (this.env.GLOBALCHECK_MCP_URL) {
+      this.addMcpServer("GlobalCheck", this.env.GLOBALCHECK_MCP_URL);
+    } else {
+      console.warn("GLOBALCHECK_MCP_URL is not set. GlobalCheck integration skipped.");
+    }
+      }
+    });
   }
 
   @callable()
@@ -47,27 +80,14 @@ export class ChatAgent extends AIChatAgent<Env> {
 
   async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
     const mcpTools = this.mcp.getAITools();
-    // Original Workers AI client for direct access if Barewire is not used for a specific call
-    const workersaiClient = createWorkersAI({ binding: this.env.AI });
-
-    // Initialize Barewire client for agentic proxying and observability.
-    // Ensure BAREWIRE_API_KEY and BAREWIRE_URL are configured in your environment (e.g., wrangler.toml).
-    const barewire = createBarewire({
-      apiKey: this.env.BAREWIRE_API_KEY,
-      baseURL: this.env.BAREWIRE_URL || "https://api.barewire.com/v1", // Default Barewire Edge Proxy URL
-    });
-
-    // Create the original Workers AI model instance
-    const actualWorkersAIModel = workersaiClient("@cf/moonshotai/kimi-k2.6", {
-      sessionAffinity: this.sessionAffinity
-    });
-
-    // Wrap the actual Workers AI model with Barewire for agentic capabilities, 
-    // enabling features like guardrails, observability, and compliance checks.
-    const proxiedModel = barewire.wrapModel(actualWorkersAIModel);
+    const workersai = createWorkersAI({ binding: this.env.AI });
+    // Initialize Barewire proxy fetch client for enhanced observability and control over outgoing requests.
+    const barewireFetch = createBarewireProxyFetch(this.env.BAREWIRE_PROXY_URL);
 
     const result = streamText({
-      model: proxiedModel,
+      model: workersai("@cf/moonshotai/kimi-k2.6", {
+        sessionAffinity: this.sessionAffinity
+      }),
       system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
 
 ${getSchedulePrompt({ date: new Date() })}
@@ -83,22 +103,42 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
         ...mcpTools,
 
         // Server-side tool: runs automatically on the server
+        // This tool is now updated to use a real weather API (OpenWeatherMap) and is proxied through Barewire.
         getWeather: tool({
           description: "Get the current weather for a city",
           inputSchema: z.object({
             city: z.string().describe("City name")
           }),
           execute: async ({ city }) => {
-            // Replace with a real weather API in production
-            const conditions = ["sunny", "cloudy", "rainy", "snowy"];
-            const temp = Math.floor(Math.random() * 30) + 5;
-            return {
-              city,
-              temperature: temp,
-              condition:
-                conditions[Math.floor(Math.random() * conditions.length)],
-              unit: "celsius"
-            };
+            if (!this.env.OPENWEATHER_API_KEY || !this.env.OPENWEATHER_API_URL) {
+              console.warn("OpenWeatherMap API key or URL not configured. Using mock weather data. Please set OPENWEATHER_API_KEY and OPENWEATHER_API_URL in your environment and configure them in wrangler.toml or your Cloudflare Worker settings.");
+              const conditions = ["sunny", "cloudy", "rainy", "snowy"];
+              const temp = Math.floor(Math.random() * 30) + 5;
+              return {
+                city,
+                temperature: temp,
+                condition: conditions[Math.floor(Math.random() * conditions.length)],
+                unit: "celsius"
+              };
+            }
+            // Proxy the real weather API call through Barewire (if BAREWIRE_PROXY_URL is set).
+            // This allows Barewire to monitor, log, and control this agentic tool execution.
+            const weatherUrl = `${this.env.OPENWEATHER_API_URL}?q=${encodeURIComponent(city)}&appid=${this.env.OPENWEATHER_API_KEY}&units=metric`;
+            const res = await barewireFetch(weatherUrl);
+            if (!res.ok) {
+              throw new Error(`Failed to fetch weather: ${res.statusText} - ${await res.text()}`);
+            }
+            const data = await res.json();
+            if (data.main && data.weather && data.name) {
+              return {
+                city: data.name,
+                temperature: data.main.temp,
+                condition: data.weather[0].description,
+                unit: "celsius"
+              };
+            } else {
+              throw new Error("Invalid weather data received from OpenWeatherMap.");
+            }
           }
         }),
 
